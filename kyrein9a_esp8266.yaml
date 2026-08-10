@@ -1,0 +1,163 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  kyrein9a_esp8266 — ESP8266 (ESP-12/NodeMCU, 4 MB) mit DS18B20
+#
+#  Pin-Belegung, aus dem alten MicroPython-Flash rekonstruiert:
+#    GPIO4  (D2) = DS18B20 OneWire-Bus
+#    GPIO15 (D8) = Digitaleingang   (muss beim Boot LOW sein!)
+#    GPIO0  (D3) = Digitalausgang   (muss beim Boot HIGH sein!)
+#    A0          = ADC, am nackten ESP8266 nur 0..1,0 V
+#
+#  MQTT OUT: kyrein9a/temp, /adc, /pin15, /rssi, /uptime
+#            kyrein9a/info    = JSON mit name + ip (wie sofar/waveshare/status)
+#  ACHTUNG: NICHT /status verwenden - das belegt ESPHome selbst als
+#  Availability-Topic, das JSON wuerde sich mit online/offline ueberschreiben.
+#
+#  WLAN: open_wifi_scan_esp8266.h haengt vor dem Verbinden das staerkste OFFENE
+#  Netz an die Liste an; was unter networks steht, ist reiner Fallback.
+#  min_auth_mode ist hier wirkungslos und nur gesetzt, um die Default-Warnung
+#  stumm zu stellen: wifi_component_esp8266.cpp setzt fuer passwortlose APs
+#  hart threshold.authmode = AUTH_OPEN, bevor min_auth_mode ueberhaupt
+#  ausgewertet wird. Offene Netze sind davon also ausgenommen.
+# ════════════════════════════════════════════════════════════════════════════
+
+substitutions:
+  device_name: kyrein9a_esp8266
+  topic_root: kyrein9a
+  mqtt_broker: 192.168.178.218
+  ota_password: !secret kyrein9a_ota_password
+  fw_version: "1.0.1"     # per OTA verteilt (Nachweis: fw im Status-JSON)
+
+esphome:
+  name: ${device_name}
+  friendly_name: kyrein9a ESP8266 DS18B20
+
+external_components:
+  - source: components
+
+# Haengt das staerkste offene Netz vor die Liste unter wifi: networks:
+open_wifi:
+  # Keine RSSI-Untergrenze: lieber ein offenes Netz mit schlechtem Empfang
+  # als gar keins.
+  survey: true    # loggt jedes gefundene Netz, nicht nur die konfigurierten
+
+esp8266:
+  board: nodemcuv2
+  # kein framework-Block: der ESP8266 kann unter ESPHome ohnehin nur Arduino,
+  # und der type-Schluessel ist in 2026.x nicht mehr zulaessig
+
+logger:
+  baud_rate: 115200      # UART-Log an: bei diesem Geraet war der serielle
+                         # Zugang schon einmal die einzige Rettung
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+wifi:
+  fast_connect: false    # muss false bleiben, sonst wird nicht gescannt
+  # Ohne Wirkung auf offene Netze (die bekommen AUTH_OPEN gesetzt), nur zum
+  # Stummschalten der Default-Warnung. 'OPEN' waere kein zulaessiger Wert.
+  min_auth_mode: WPA
+  networks:
+    - ssid: free5G
+      password: !secret wifi_dach_password
+    - ssid: free5G_EXT      # gleicher Schluessel wie free5G
+      password: !secret wifi_dach_password
+  ap:
+    ssid: ${topic_root}-fallback
+    password: !secret kyrein9a_ap_password
+
+captive_portal:
+
+mqtt:
+  id: mqtt_client
+  broker: ${mqtt_broker}
+  topic_prefix: ${topic_root}
+  discovery: false
+  birth_message:
+    topic: ${topic_root}/online
+    payload: "true"
+  will_message:
+    topic: ${topic_root}/online
+    payload: "false"
+  log_topic:
+    topic: ${topic_root}/debug
+    level: INFO
+
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+
+text_sensor:
+  # Liefert die IP fuer das Status-JSON; nicht als eigenes Topic noetig.
+  - platform: wifi_info
+    ip_address:
+      id: dev_ip
+      internal: true
+
+sensor:
+  - platform: dallas_temp
+    name: Temperatur
+    id: ds_temp
+    update_interval: 30s
+    state_topic: ${topic_root}/temp
+    accuracy_decimals: 2
+
+  - platform: adc
+    pin: A0
+    name: ADC
+    id: adc_raw
+    update_interval: 30s
+    state_topic: ${topic_root}/adc
+    raw: true
+
+  - platform: uptime
+    name: Uptime
+    id: sys_uptime
+    update_interval: 60s
+    state_topic: ${topic_root}/uptime
+
+  - platform: wifi_signal
+    name: RSSI
+    id: wifi_rssi
+    update_interval: 60s
+    state_topic: ${topic_root}/rssi
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO15
+      mode:
+        input: true
+    name: Eingang15
+    id: in15
+    state_topic: ${topic_root}/pin15
+
+switch:
+  - platform: gpio
+    pin: GPIO0
+    name: Ausgang0
+    id: out0
+    restore_mode: ALWAYS_ON    # alte main.py machte p0.on() beim Start
+
+interval:
+  # Status-JSON mit Name und IP — gleiche Bauart wie sofar/waveshare/status,
+  # damit ein Mitschnitt das Geraet sofort identifizierbar macht.
+  - interval: 60s
+    then:
+      - lambda: |-
+          char buf[220];
+          float t = id(ds_temp).state;
+          snprintf(buf, sizeof(buf),
+            "{\"name\":\"%s\",\"ip\":\"%s\",\"fw\":\"%s\","
+            "\"temp\":%.2f,\"adc\":%.0f,\"pin15\":%d,"
+            "\"rssi\":%.0f,\"uptime\":%.0f}",
+            "${device_name}",
+            id(dev_ip).state.c_str(),
+            "${fw_version}",
+            isnan(t) ? -127.0f : t,
+            id(adc_raw).state,
+            id(in15).state ? 1 : 0,
+            id(wifi_rssi).state,
+            id(sys_uptime).state);
+          id(mqtt_client).publish("${topic_root}/info", buf, 0, true);

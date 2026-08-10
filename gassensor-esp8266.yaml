@@ -1,0 +1,244 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  gassensor-esp8266 — MiCS-6814 Multichannel-Gassensor
+#
+#  HARDWARE (aus dem Dump der Originalfirmware rekonstruiert, nicht geraten):
+#    ESP8266EX, 4 MB Flash, MAC 84:0D:8E:A3:C0:FD, CH340 an /dev/ttyUSB0
+#    Seeed Grove Multichannel Gas Sensor v1
+#      = MiCS-6814 + ATmega168-Co-Prozessor, I2C 0x04, Co-Firmware v2
+#      SDA=GPIO4 (D2), SCL=GPIO5 (D1)
+#
+#  WARUM DIE ALTE FIRMWARE NICHTS LIEFERTE:
+#    WiFiManager-Parameter waren nie gespeichert (SPIFFS leer, keine
+#    config.json) -> mqtt_server = "" und mqtt_port = "300000" (als Port
+#    ungueltig). PubSubClient blieb in reconnect() mit rc=-2 haengen, und weil
+#    die Messroutine erst NACH dem Publish laeuft, kam nie ein Wert. Der Sensor
+#    selbst war die ganze Zeit in Ordnung: "Firmware Version = 2" beim Boot ist
+#    ein echter I2C-Read (EEPROM == 1126), kein einkompilierter Text.
+#
+#  RUECKWEG: vollstaendiges Originalimage liegt unter
+#    backup/gassensor-esp8266_orig_4MB_840d8ea3c0fd.bin
+#    md5 32902042ea96ac6f1c4bd9f84736803d
+#    esptool --port /dev/ttyUSB0 write-flash 0x0 <datei>
+#
+#  MQTT OUT: gassensor/{NH3,CO,NO2,C3H8,C4H10,CH4,H2,C2H5OH}  (ppm, nicht retained)
+#            gassensor/info   = JSON, retained - Quelle fuer den 15-min-Logger
+#  MQTT IN : gassensor/openwifi       {"ENABLE":0} holt das Board zurueck auf f24
+#            gassensor/openwifi/scan  sofortiger Neu-Scan
+#            gassensor/measure        Sofortmessung ausserhalb des Rasters
+#
+#  Die alte Firmware sendete auf /home/data/<GAS>; bewusst nicht uebernommen,
+#  weil dieses Geraet jetzt der Konvention der uebrigen Nodes folgt
+#  (<topic_root>/<wert>, plus <topic_root>/info als Status-JSON).
+# ════════════════════════════════════════════════════════════════════════════
+
+substitutions:
+  device_name: gassensor-esp8266
+  topic_root: gassensor
+  mqtt_broker: 192.168.178.218
+  # Fallback-WLAN: WPA2 und im selben Netz wie der Broker. Bewusst nicht das
+  # offene f7240 wie bei der Originalfirmware - ein verschluesseltes Netz mit
+  # garantierter Broker-Erreichbarkeit ist die bessere Rueckfallebene.
+  wifi_ssid: f24
+  wifi_password: !secret wifi_f24_password
+  ota_password: !secret gassensor_ota_password
+  fw_version: "1.0.0"
+
+esphome:
+  name: ${device_name}
+  friendly_name: Gassensor MiCS-6814
+  includes:
+    - gas_mics6814_v2.h
+  on_boot:
+    # Prioritaet 250: nach der Hardware, vor WiFi/MQTT. Der Heizer soll so
+    # frueh wie moeglich anlaufen, seine Einlaufzeit ist die langsamste
+    # Groesse im System.
+    priority: 250
+    then:
+      - lambda: |-
+          mics_begin();
+          mics_scan();
+
+# Dieselbe Komponente wie kyrein9a_esp8266 - fuer ESP8266 gibt es hier genau
+# einen WLAN-Mechanismus, keinen zweiten per includes daneben.
+external_components:
+  - source: components
+
+open_wifi:
+  id: openwifi
+  # Bestes offenes Haus-WLAN gewinnt; f24 ist die verschluesselte Rueckfallebene
+  # im selben Netz wie der Broker. Bewusst OHNE statische Blocklist: ein offenes
+  # Netz ohne Broker-Zugang faengt der Watchdog unten selbst ab.
+  fallback_ssid: ${wifi_ssid}
+  fallback_password: ${wifi_password}
+  survey: true
+
+esp8266:
+  board: nodemcuv2      # 4 MB, deckt sich mit dem erkannten Flash
+
+logger:
+  baud_rate: 115200
+  level: DEBUG
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+wifi:
+  fast_connect: false   # muss false bleiben, sonst wird nicht gescannt
+  networks:
+    - ssid: ${wifi_ssid}
+      password: ${wifi_password}
+  ap:
+    ssid: ${device_name}-fallback
+    password: !secret gassensor_ap_password
+
+captive_portal:
+
+# Besitzer des I2C-Busses. Zwingend, auch ohne eine einzige i2c-Sensorplattform
+# darunter: ohne diesen Block bindet PlatformIO die Wire-Bibliothek nicht ein,
+# und gas_mics6814_v2.h scheitert an "Wire.h: No such file or directory".
+# Der Block uebernimmt zugleich Wire.begin() - der Header initialisiert daher
+# selbst nicht mehr, sonst wuerde der Bus zweimal aufgesetzt.
+i2c:
+  id: bus_a
+  sda: GPIO4        # D2
+  scl: GPIO5        # D1
+  frequency: 100kHz
+  scan: true        # loggt beim Start alle gefundenen Adressen - 0x04 erwartet
+
+mqtt:
+  id: mqtt_client
+  broker: ${mqtt_broker}
+  port: 1883
+  client_id: ${device_name}
+  keepalive: 60s
+  reboot_timeout: 15min
+  discovery: false
+  birth_message:
+    topic: ${topic_root}/online
+    payload: "true"
+  will_message:
+    topic: ${topic_root}/online
+    payload: "false"
+  log_topic:
+    topic: ${topic_root}/debug
+    level: INFO
+  on_message:
+    # ── Offenes WLAN an/aus: {"ENABLE":0} holt das Board zurueck auf f24 ────
+    - topic: ${topic_root}/openwifi
+      then:
+        # {"ENABLE":0} = Wartungsfenster: zurueck auf ${wifi_ssid}, damit OTA aus
+        # einem erreichbaren Subnetz moeglich ist. {"ENABLE":1} = sofort zurueck
+        # auf "bestes offenes Netz".
+        #
+        # Der Neustart ist noetig, nicht bequem: auf dem ESP8266 wertet ESPHome
+        # eine neu aufgebaute STA-Liste im laufenden Betrieb nicht zuverlaessig
+        # aus - das Kommando wurde zwar verarbeitet und protokolliert, das Board
+        # blieb aber am alten AP haengen. set_enabled() sichert den Schalter
+        # vorher im Flash, sonst waere er nach dem Neustart wieder "an".
+        #
+        # Der Zustand verfaellt von selbst: disable_timeout (600 s) holt das
+        # Board danach automatisch auf das beste offene Netz zurueck. Der
+        # Wunschzustand bleibt so immer der Normalzustand.
+        - lambda: |-
+            id(openwifi).set_enabled(x.find("1") != std::string::npos);
+        - delay: 2s          # Log und MQTT-Quittung noch rauslassen
+        - lambda: |-
+            App.safe_reboot();
+
+    # ── Sofort-Scan anstossen ──────────────────────────────────────────────
+    - topic: ${topic_root}/openwifi/scan
+      then:
+        - lambda: |-
+            id(openwifi).rescan();
+
+    # ── Sofortmessung ausserhalb des 60-s-Rasters ──────────────────────────
+    - topic: ${topic_root}/measure
+      then:
+        - script.execute: measure_publish
+
+script:
+  - id: measure_publish
+    mode: single
+    then:
+      - lambda: |-
+          MicsReading r = mics_measure();
+          if (!r.ok) {
+            id(mqtt_client).publish("${topic_root}/error", "i2c read failed");
+            return;
+          }
+          auto pub = [](const char *t, float v) {
+            if (isnan(v) || isinf(v)) return;              // unkalibriert/Anschlag
+            char b[24]; snprintf(b, sizeof(b), "%.4f", v);
+            id(mqtt_client).publish(t, b);
+          };
+          pub("${topic_root}/NH3",    r.nh3);
+          pub("${topic_root}/CO",     r.co);
+          pub("${topic_root}/NO2",    r.no2);
+          pub("${topic_root}/C3H8",   r.c3h8);
+          pub("${topic_root}/C4H10",  r.c4h10);
+          pub("${topic_root}/CH4",    r.ch4);
+          pub("${topic_root}/H2",     r.h2);
+          pub("${topic_root}/C2H5OH", r.c2h5oh);
+
+          // Status-JSON, retained: der 15-min-Logger auf dem Pi liest genau
+          // dieses Topic. uptime_ms macht eine veraltete retained Nachricht
+          // erkennbar - ohne das koennte der Logger einen alten Wert als
+          // frische Messung eintragen (dieselbe Falle wie seinerzeit bei ky9a).
+          char buf[420];
+          snprintf(buf, sizeof(buf),
+            "{\"name\":\"%s\",\"fw\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime_ms\":%lu,"
+            "\"NH3\":%.4f,\"CO\":%.4f,\"NO2\":%.4f,\"C3H8\":%.4f,\"C4H10\":%.4f,"
+            "\"CH4\":%.4f,\"H2\":%.4f,\"C2H5OH\":%.4f,"
+            "\"adc\":[%u,%u,%u],\"r0\":[%u,%u,%u],\"ssid\":\"%s\"}",
+            "${device_name}", "${fw_version}",
+            // Arduino-API statt WiFiComponent: ein wifi_sta_ip() gibt es in
+            // ESPHome 2026.2 nicht (mehr). WiFi.localIP() kommt aus
+            // ESP8266WiFi.h, das open_wifi_join_esp8266.h ohnehin einbindet.
+            WiFi.localIP().toString().c_str(),
+            (int) WiFi.RSSI(), (unsigned long) millis(),
+            r.nh3, r.co, r.no2, r.c3h8, r.c4h10, r.ch4, r.h2, r.c2h5oh,
+            r.adc_nh3, r.adc_co, r.adc_no2, r.r0_nh3, r.r0_co, r.r0_no2,
+            id(openwifi).current_ssid().c_str());
+          // NICHT retained (letztes Argument false).
+          //
+          // Retained war ein Fehlgriff: als das Board am 10.08.2026 ausfiel,
+          // lieferte der Broker die letzte Nachricht unveraendert weiter aus.
+          // Ein totes Geraet sah damit exakt aus wie ein lebendes - dieselbe
+          // eingefrorene Messung, nur mit stehender uptime_ms. In Produktion
+          // ist das schlimmer als gar kein Wert: ein fehlender Wert faellt auf,
+          // ein falscher nicht.
+          //
+          // Frische kommt jetzt aus dem Protokoll statt aus einer Konvention:
+          // wer den Wert will, muss eine echte Nachricht abwarten. Der
+          // 15-min-Logger lauscht dafuer bis zu 90 s (Publish-Takt 60 s), das
+          // Fenster ist also groesser als die Periode. Bleibt es still, ist das
+          // Geraet still - und die Zeile wird als stale mit NULL geschrieben.
+          //
+          // Beide Argumente ausdruecklich als std::string: mit (topic, char*, 0,
+          // false) greift die Ueberladung publish(topic, payload,
+          // payload_length, qos) und die Nutzlast waere leer.
+          id(mqtt_client).publish(std::string("${topic_root}/info"), std::string(buf), 0, false);
+
+interval:
+  # Messen und senden. 60 s, damit der 15-min-Logger immer einen frischen
+  # retained Stand vorfindet.
+  - interval: 60s
+    then:
+      - script.execute: measure_publish
+
+  # Nach dem Start einmal das beste offene Netz suchen, danach im Takt
+  # nachfuehren, falls sich die Lage aendert.
+  - interval: 10min
+    then:
+      - lambda: |-
+          id(openwifi).rescan();
+
+  # Watchdog: haengt das Board an einem offenen AP ohne MQTT-Durchgang
+  # (Captive Portal, Geraete-AP, abgeschottetes Subnetz), wird die SSID nach
+  # 3 min auf die RAM-Blacklist gesetzt und ${wifi_ssid} uebernimmt wieder.
+  # Genau deshalb braucht es keine statische Blocklist.
+  - interval: 15s
+    then:
+      - lambda: |-
+          id(openwifi).watchdog(id(mqtt_client).is_connected(), 180000);
