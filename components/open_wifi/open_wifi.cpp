@@ -6,6 +6,10 @@
 #include "esphome/core/log.h"
 #include "esphome/components/wifi/wifi_component.h"
 
+#ifdef USE_MQTT
+#include "esphome/components/mqtt/mqtt_client.h"
+#endif
+
 #if defined(USE_ESP8266)
 #include <ESP8266WiFi.h>
 #elif defined(USE_ESP32)
@@ -71,9 +75,22 @@ std::string OpenWifiScan::find_best_open_(int *rssi_out) {
   // Der Scan dauert ueber eine Sekunde. Ohne Fuettern schlaegt auf dem ESP8266
   // der Software-Watchdog zu, sobald der Aufruf nicht aus setup() kommt.
   App.feed_wdt();
+  const bool report = !this->report_topic_.empty();
+  size_t idx = 0;
+  if (report)
+    this->hidden_ = 0;
   if (n <= 0) {
     ESP_LOGW(TAG, "Scan found nothing");
     WiFi.scanDelete();
+    if (report) {
+      // Auch "nichts gefunden" ist eine dokumentierenswerte Entscheidung.
+      this->survey_buf_.resize(0);
+      this->scanned_ = 0;
+      this->chosen_.clear();
+      this->chosen_rssi_ = -127;
+      this->survey_at_ = millis();
+      this->report_pending_ = true;
+    }
     return best;
   }
 
@@ -101,6 +118,41 @@ std::string OpenWifiScan::find_best_open_(int *rssi_out) {
       best_any_ssid = ssid;
     }
 
+    if (report) {
+      // Begruendung, warum dieses Netz am Ende (nicht) genommen wird.
+      const char *why;
+      if (!open) {
+        why = "enc";
+      } else if (ssid.empty()) {
+        why = "hidden";
+      } else if (is_device_ap_(ssid)) {
+        why = "devap";
+      } else if (this->is_blocked_(ssid)) {
+        why = "blocked";
+      } else {
+        why = "open";
+      }
+
+      if (ssid.empty()) {
+        this->hidden_++;
+      } else {
+        // Eintrag wiederverwenden statt neu zu allokieren: der String-Buffer
+        // bleibt erhalten, solange die neue SSID hineinpasst.
+        if (idx < this->survey_buf_.size()) {
+          SurveyEntry &e = this->survey_buf_[idx];
+          e.ssid = ssid;
+          e.rssi = rssi;
+          e.channel = (uint8_t) WiFi.channel(i);
+          e.open = open;
+          e.why = why;
+        } else {
+          this->survey_buf_.push_back(
+              SurveyEntry{ssid, rssi, (uint8_t) WiFi.channel(i), open, why});
+        }
+        idx++;
+      }
+    }
+
     // Bewusst keine RSSI-Untergrenze: lieber ein offenes Netz mit schlechtem
     // Empfang als gar keins. Netze ohne Broker-Durchgang faengt der Watchdog ab.
     if (!open || ssid.empty())
@@ -119,6 +171,21 @@ std::string OpenWifiScan::find_best_open_(int *rssi_out) {
   ESP_LOGI(TAG, "Scanned %d networks, strongest '%s' RSSI=%d", n, best_any_ssid.c_str(),
            best_any_rssi);
   WiFi.scanDelete();
+
+  if (report) {
+    this->survey_buf_.resize(idx);
+    this->scanned_ = n;
+    this->chosen_ = best;
+    this->chosen_rssi_ = best_rssi;
+    for (auto &e : this->survey_buf_) {
+      if (!best.empty() && e.ssid == best) {
+        e.why = "best";
+        break;
+      }
+    }
+    this->survey_at_ = millis();
+    this->report_pending_ = true;
+  }
 #endif
 
   if (rssi_out != nullptr)
@@ -230,6 +297,9 @@ void OpenWifiScan::setup() {
 }
 
 void OpenWifiScan::loop() {
+  // Gepufferten Survey-Report so bald wie moeglich rausgeben.
+  this->try_report_();
+
   // Der Schalter ist eine befristete Wartungsklappe, kein Dauerzustand: das
   // gewuenschte Verhalten ist "immer das beste offene Netz". Vergisst jemand,
   // {"ENABLE":1} nachzuschicken, holt sich das Board den Zustand selbst zurueck.
@@ -326,10 +396,91 @@ bool OpenWifiScan::watchdog(bool mqtt_connected, uint32_t timeout_ms) {
   return true;
 }
 
+// SSID JSON-sicher einpacken (Anfuehrungszeichen, Backslash, Steuerzeichen).
+static void json_escape_(std::string &out, const std::string &s) {
+  out += '"';
+  for (const char c : s) {
+    if (c == '"' || c == '\\')
+      out += '\\';
+    if ((unsigned char) c < 0x20) {
+      out += '?';
+      continue;
+    }
+    out += c;
+  }
+  out += '"';
+}
+
+void OpenWifiScan::try_report_() {
+  if (!this->report_pending_)
+    return;
+  // Der Puffer bleibt report_delay stehen: beim Boot liegt der Scan vor dem
+  // MQTT-Connect, die Nachricht braucht diese Anlaufzeit.
+  if (millis() - this->survey_at_ < this->report_delay_ms_)
+    return;
+
+#ifdef USE_MQTT
+  auto *mqtt_client = mqtt::global_mqtt_client;
+  if (mqtt_client == nullptr || !mqtt_client->is_connected())
+    return;  // weiter warten: erst NACH erfolgreichem Publish vergessen
+  if (!this->publish_survey_())
+    return;
+  ESP_LOGI(TAG, "Survey-Report publiziert: %d APs, Entscheidung '%s' RSSI=%d -> '%s'",
+           this->scanned_, this->chosen_.c_str(), this->chosen_rssi_,
+           this->report_topic_.c_str());
+#else
+  ESP_LOGW(TAG, "Survey-Report verworfen (kein MQTT konfiguriert)");
+#endif
+  // Daten bleiben im Cache liegen: der naechste Scan ueberschreibt sie und
+  // verwendet die Buffer wieder. Nur der Pending-Zustand wird geloest.
+  this->report_pending_ = false;
+}
+
+bool OpenWifiScan::publish_survey_() {
+#ifdef USE_MQTT
+  auto *mqtt_client = mqtt::global_mqtt_client;
+  if (mqtt_client == nullptr)
+    return false;
+
+  std::string out;
+  out.reserve(96 + this->survey_buf_.size() * 72);
+  char num[48];
+
+  snprintf(num, sizeof(num), "{\"ts_ms\":%lu", (unsigned long) millis());
+  out += num;
+  snprintf(num, sizeof(num), ",\"scanned\":%d,\"hidden\":%d", this->scanned_, this->hidden_);
+  out += num;
+  out += ",\"chosen\":";
+  json_escape_(out, this->chosen_);
+  snprintf(num, sizeof(num), ",\"chosen_rssi\":%d,\"aps\":[", this->chosen_rssi_);
+  out += num;
+
+  bool first = true;
+  for (const auto &e : this->survey_buf_) {
+    if (!first)
+      out += ',';
+    first = false;
+    out += "{\"ssid\":";
+    json_escape_(out, e.ssid);
+    snprintf(num, sizeof(num), ",\"ch\":%u,\"rssi\":%d,\"open\":%d,\"why\":\"%s\"}",
+             (unsigned) e.channel, e.rssi, e.open ? 1 : 0, e.why);
+    out += num;
+  }
+  out += "]}";
+
+  // qos 0, retain true: der letzte Report bleibt am Broker ablesbar.
+  return mqtt_client->publish(this->report_topic_, out, 0, true);
+#else
+  return false;
+#endif
+}
+
 void OpenWifiScan::dump_config() {
   ESP_LOGCONFIG(TAG, "Open WiFi Scan:");
   ESP_LOGCONFIG(TAG, "  Enabled: %s", YESNO(this->enabled_));
   ESP_LOGCONFIG(TAG, "  Survey: %s", YESNO(this->survey_));
+  ESP_LOGCONFIG(TAG, "  Report topic: %s", this->report_topic_.c_str());
+  ESP_LOGCONFIG(TAG, "  Report delay: %u ms", (unsigned) this->report_delay_ms_);
   ESP_LOGCONFIG(TAG, "  Fallback SSID: %s%s", this->fallback_ssid_.c_str(),
                 this->fallback_password_.empty() ? " (offen)" : " (verschluesselt)");
   ESP_LOGCONFIG(TAG, "  Blocked SSIDs: %u", (unsigned) this->blocklist_.size());

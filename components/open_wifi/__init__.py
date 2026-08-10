@@ -21,6 +21,8 @@ DEPENDENCIES = ["wifi"]
 
 CONF_SSID_BLOCKLIST = "ssid_blocklist"
 CONF_SURVEY = "survey"
+CONF_REPORT_TOPIC = "report_topic"
+CONF_REPORT_DELAY = "report_delay"
 CONF_FALLBACK_SSID = "fallback_ssid"
 CONF_FALLBACK_PASSWORD = "fallback_password"
 CONF_DISABLE_TIMEOUT = "disable_timeout"
@@ -40,6 +42,12 @@ CONFIG_SCHEMA = cv.Schema(
         # extra (der Scan laeuft ohnehin) und fehlt sonst genau dann, wenn
         # man sie braucht.
         cv.Optional(CONF_SURVEY, default=True): cv.boolean,
+        # MQTT-Topic fuer die dokumentierte Survey-Entscheidung (retained).
+        # Leer = Report aus. Der Scan passiert beim Boot VOR der MQTT-
+        # Verbindung; der Puffer ueberbrueckt das und publiziert, sobald
+        # der Broker erreichbar ist - erst danach gilt er als vergessen.
+        cv.Optional(CONF_REPORT_TOPIC, default=""): cv.string,
+        cv.Optional(CONF_REPORT_DELAY, default="10s"): cv.positive_time_period_milliseconds,
         # Offenes Fallback-Netz. Muss hier stehen und nicht nur unter
         # wifi: networks:, weil die Komponente die Liste neu aufbaut -
         # der Codegen fuellt sonst jeden Platz und FixedVector::push_back
@@ -63,6 +71,8 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_survey(config[CONF_SURVEY]))
+    cg.add(var.set_report_topic(config[CONF_REPORT_TOPIC]))
+    cg.add(var.set_report_delay(config[CONF_REPORT_DELAY]))
     cg.add(var.set_fallback_ssid(config[CONF_FALLBACK_SSID]))
     cg.add(var.set_fallback_password(config[CONF_FALLBACK_PASSWORD]))
     cg.add(var.set_disable_timeout(config[CONF_DISABLE_TIMEOUT]))

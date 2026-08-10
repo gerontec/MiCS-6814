@@ -35,6 +35,9 @@ class OpenWifiScan : public Component {
   void dump_config() override;
 
   void set_survey(bool survey) { this->survey_ = survey; }
+  // Survey-Entscheidung per MQTT dokumentieren. Topic leer = Report aus.
+  void set_report_topic(const std::string &topic) { this->report_topic_ = topic; }
+  void set_report_delay(uint32_t ms) { this->report_delay_ms_ = ms; }
   void set_fallback_ssid(const std::string &ssid) { this->fallback_ssid_ = ssid; }
   // Fallback darf verschluesselt sein. Ohne das liesse sich als Rueckfallebene
   // nur ein weiteres offenes Netz angeben - genau die Bauart, die einen bei
@@ -69,11 +72,23 @@ class OpenWifiScan : public Component {
   static bool is_device_ap_(const std::string &ssid);
   // Bester offener AP; "" wenn keiner brauchbar ist.
   std::string find_best_open_(int *rssi_out);
+  // Survey-Puffer nach report_delay als Retained-Nachricht rausgeben.
+  void try_report_();
+  bool publish_survey_();
   // STA-Liste neu bauen: offener AP zuerst, danach das Fallback.
   void apply_(const std::string &open_ssid);
   void blacklist_add_(const std::string &ssid);
   // Assoziation wirklich loesen, damit ESPHome die neue Liste auswertet.
   void force_reconnect_();
+
+  // Ein Eintrag der Survey: alles, was die Entscheidung begruendet.
+  struct SurveyEntry {
+    std::string ssid;
+    int rssi{0};
+    uint8_t channel{0};
+    bool open{false};
+    const char *why{nullptr};  // "best", "open", "enc", "devap", "blocked"
+  };
 
   bool survey_{true};
   std::string fallback_ssid_;
@@ -95,6 +110,21 @@ class OpenWifiScan : public Component {
   // das Wartungsfenster beginnt, wenn das Board auf dem Fallback ankommt.
   uint32_t disable_timeout_ms_{600000};
   uint32_t disabled_since_{0};
+
+  // Survey-Report. Der Puffer wird nach dem Publish NICHT freigegeben: der
+  // naechste Scan ueberschreibt die Eintraege und die String-Buffer werden
+  // dabei wiederverwendet (kein Alloc-Churn auf dem ESP8266-Heap). Der
+  // High-Water-Mark bleibt liegen, bis er gebraucht wird - "Cache statt
+  // Freigeben" auf einem System ohne Garbage Collector.
+  std::vector<SurveyEntry> survey_buf_;
+  bool report_pending_{false};
+  uint32_t survey_at_{0};
+  uint32_t report_delay_ms_{10000};
+  std::string report_topic_;
+  int scanned_{0};
+  int hidden_{0};
+  std::string chosen_;
+  int chosen_rssi_{-127};
   // Aktuell bevorzugter offener AP ("" = nur Fallback).
   std::string preferred_;
   bool applied_{false};

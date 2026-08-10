@@ -22,6 +22,8 @@
 #
 #  MQTT OUT: gassensor/{NH3,CO,NO2,C3H8,C4H10,CH4,H2,C2H5OH}  (ppm, nicht retained)
 #            gassensor/info   = JSON, retained - Quelle fuer den 15-min-Logger
+#            gassensor/wifiscan = JSON, retained - dokumentierte Survey-
+#            Entscheidung: alle gesehenen APs mit Kanal/RSSI + gewaehlter AP
 #  MQTT IN : gassensor/openwifi       {"ENABLE":0} holt das Board zurueck auf f24
 #            gassensor/openwifi/scan  sofortiger Neu-Scan
 #            gassensor/measure        Sofortmessung ausserhalb des Rasters
@@ -71,6 +73,11 @@ open_wifi:
   fallback_ssid: ${wifi_ssid}
   fallback_password: ${wifi_password}
   survey: true
+  # Survey-Entscheidung dokumentieren: alle gesehenen APs mit RSSI und der
+  # gewaehlte Kandidat. 10 s gepuffert, damit MQTT nach dem Boot hochkommt,
+  # dann retained publiziert. Der Puffer bleibt danach liegen und wird vom
+  # naechsten Scan ueberschrieben (kein Alloc-Churn auf dem ESP8266-Heap).
+  report_topic: ${topic_root}/wifiscan
 
 esp8266:
   board: nodemcuv2      # 4 MB, deckt sich mit dem erkannten Flash
